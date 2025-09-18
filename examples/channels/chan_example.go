@@ -1,119 +1,85 @@
+// Package main demonstrates Go concurrency patterns through a coffee shop simulation.
+// Features showcased:
+// - Buffered channels for async communication and backpressure handling
+// - Select statements for non-blocking operations and timeouts
+// - Exponential backoff with jitter for retry logic
+// - Type-safe directional channels (send-only vs receive-only)
+// - Coordinated goroutine shutdown patterns
 package main
 
 import (
 	"fmt"
-	"math/rand"
-	"time"
+	"sync"
 )
 
-// waitress simulates a waitress placing orders into the orders channel.
-// It handles backpressure by retrying if the channel is full, using linear backoff.
-func waitress(orders OrdersIn, customers int) {
-	for i := 1; i <= customers; i++ {
-		order := fmt.Sprintf("Coffee #%d", i) // Create a new coffee order
-		select {
-		case orders <- order: // Try to send order to barista
-			pause := 50 + time.Duration(rand.Intn(100)) // Random delay (50-150ms) - moderate to show flow
-			fmt.Println("📝 Taking order, waiting...")   // Simulate order-taking delay
-			time.Sleep(pause * time.Millisecond)
-			fmt.Println("🗒️ Placed:", order)
-		default: // Channel is full (backpressure), retry with backoff
-			pause := 200 + time.Duration(rand.Intn(300)) // Backoff delay (200-500ms) - longer to demonstrate backpressure
-			fmt.Println("⏳ Barista is full, waiting...") // Indicate backpressure
-			time.Sleep(pause * time.Millisecond)         // Linear backoff delay
-			i--                                          // Retry the same order
-		}
-	}
-	close(orders) // Close channel after all orders are placed
-}
+// Channel type aliases enforce directional usage at compile-time.
+// This prevents accidentally sending to receive-only channels or vice versa,
+// making the code more robust and self-documenting.
 
-// barista simulates a barista processing orders from the merged channel.
-// It brews coffee with a random delay, handles timeouts, and retries failures.
-func barista(merged MergedOut, retries RetriesIn, failure int) {
-	for coffee := range merged { // Receive orders from merged channel
-		pause := 500 + time.Duration(rand.Intn(500)) // Random brewing time (500-1000ms) - longer to trigger timeouts
-		fmt.Printf("🍵 Brewing... %s (estimated %dms)\n", coffee, pause)
+// Send-only channel types (data flows INTO these channels)
+type OrdersIn chan<- string  // Waitress sends orders →
+type RetriesIn chan<- string // Barista sends failed orders →
+type MergedIn chan<- string  // Manager sends merged orders →
+type DeadIn chan<- string    // Manager sends dead letters →
 
-		// Single timeout with brewing simulation
-		timeout := time.After(900 * time.Millisecond) // Timeout at 800ms - allows some timeouts
-		brewing := time.After(pause * time.Millisecond)
+// Receive-only channel types (data flows OUT OF these channels)
+type OrdersOut <-chan string  // Manager receives from orders ←
+type RetriesOut <-chan string // Manager receives from retries ←
+type MergedOut <-chan string  // Barista receives from merged ←
 
-		select {
-		case <-brewing: // Brewing completed on time
-			pause := 100 + time.Duration(rand.Intn(100)) // Delivery delay (100-200ms) - short but noticeable
-			fmt.Printf("☕ Prepared %s on time, delivering...\n", coffee)
-			time.Sleep(pause * time.Millisecond) // Simulate delivery time
-		case <-timeout: // Timeout if brewing takes too long
-			pause := 100 + time.Duration(rand.Intn(100))                     // Retry delay (100-200ms) - short but noticeable
-			fmt.Printf("⏰ Timeout: %s took too long, retrying...\n", coffee) // Simulate retry delay
-			select {
-			case retries <- coffee: // Try to send to retries channel
-				fmt.Printf("🔄 Retrying %s after timeout...\n", coffee)
-				time.Sleep(pause * time.Millisecond)
-			default:
-				fmt.Printf("🚫 Retry queue full after timeout, dropping %s\n", coffee)
-			}
-			continue // Skip to next order, can't fail if timed out
-		}
-
-		// Simulate random delivery failure (after successful brew)
-		if rand.Intn(10) < failure { // failure% chance of failure
-			fmt.Printf("❌ Failed to deliver %s, retrying...\n", coffee)
-			select {
-			case retries <- coffee: // Send failed order to retry channel
-				pause := 100 + time.Duration(rand.Intn(100)) // Retry delay (100-200ms) - short but noticeable
-				fmt.Printf("🔄 Retrying %s...\n", coffee)     // Simulate retry delay
-				time.Sleep(pause * time.Millisecond)
-			default: // Retry channel full, drop the order
-				fmt.Printf("🚫 Retry queue full, dropping %s\n", coffee)
-			}
-			continue // Skip to next order
-		}
-		fmt.Printf("✅ Delivered: %s\n", coffee) // Successful delivery
-	}
-}
-
-// manager merges orders and retries into a single merged channel for the barista.
-// It ensures all orders (new and retried) are processed, even after orders channel closes.
-func manager(merged MergedIn, orders OrdersOut, retries RetriesOut) {
-	defer close(merged)                                       // Close merged channel when done
-	for ordersOpen := true; ordersOpen || len(retries) > 0; { // Loop until orders closed and retries empty
-		select {
-		case order, ok := <-orders: // Receive from orders channel
-			if ok {
-				merged <- order // Forward order to merged
-			} else {
-				ordersOpen = false // Orders channel closed
-			}
-		case retry := <-retries: // Receive from retries channel
-			merged <- retry // Forward retry to merged
-		}
-	}
-}
-
-// Type aliases for type safety: enforce send-only or receive-only channels
-// Only-Write (send-only)
-type OrdersIn chan<- string
-type RetriesIn chan<- string
-type MergedIn chan<- string
-
-// Only-Read (receive-only)
-type OrdersOut <-chan string
-type RetriesOut <-chan string
-type MergedOut <-chan string
-
-// main sets up the channels, starts goroutines, and runs the barista.
-// Demonstrates buffered channels, backpressure, and timeouts.
+// main orchestrates the coffee shop simulation with proper goroutine coordination.
+// Sets up buffered channels, launches worker goroutines, and waits for completion.
 func main() {
-	// Create buffered channels for backpressure handling
-	orders := make(chan string, 3)  // Buffer for new orders
-	retries := make(chan string, 8) // Buffer for failed retries
-	merged := make(chan string, 4)  // Buffer for merged orders
+	tracker := &RetryTracker{
+		counts:   make(map[string]int),
+		maxRetry: 2, // Allow up to 3 total attempts per order
+	}
 
-	// Start goroutines: waitress places orders, manager merges them
-	go waitress(OrdersIn(orders), 15) // Place 15 orders
-	go manager(MergedIn(merged), OrdersOut(orders), RetriesOut(retries))
+	var wg sync.WaitGroup
 
-	// Run barista synchronously (blocks until merged closes)
-	barista(MergedOut(merged), RetriesIn(retries), 2) // 20% failure rate
+	fmt.Println("🏪 Coffee Shop Simulation Starting")
+	fmt.Println("=================================")
+
+	// Create buffered channels with different capacities for realistic flow control
+	orders := make(chan string, 10)  // New orders queue
+	retries := make(chan string, 10) // Failed order retry queue
+	merged := make(chan string, 10)  // Combined work queue for barista
+	dead := make(chan string, 10)    // Dead letter queue for failed orders
+
+	fmt.Printf("📊 Channel capacities - Orders: %d, Retries: %d, Merged: %d, Dead: %d\n",
+		cap(orders), cap(retries), cap(merged), cap(dead))
+
+	// Launch all goroutines with proper coordination
+	wg.Add(4)
+	fmt.Println("🚀 Starting all goroutines")
+
+	go func() {
+		defer wg.Done()
+		waitress(OrdersIn(orders), 20, tracker)
+	}()
+
+	go func() {
+		defer wg.Done()
+		manager(MergedIn(merged), OrdersOut(orders), RetriesOut(retries), DeadIn(dead), tracker)
+		close(dead) // Close dead letters when manager completes
+	}()
+
+	go func() {
+		defer wg.Done()
+		barista(MergedOut(merged), RetriesIn(retries), 2, tracker) // 20% failure rate
+	}()
+
+	go func() {
+		defer wg.Done()
+		// Process dead letters (orders that exceeded retry limits)
+		for order := range dead {
+			fmt.Printf("📮 Dead Letter: %s moved to failed orders log\n", order)
+		}
+	}()
+
+	// Wait for all goroutines to complete their work
+	wg.Wait()
+
+	fmt.Println("=================================")
+	fmt.Println("🎉 Coffee Shop Simulation Complete!")
 }
